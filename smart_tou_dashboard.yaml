@@ -1,0 +1,340 @@
+# Smart TOU - dashboard
+# Kräver: HACS-kortet "apexcharts-card" (RomRider). Allt annat är standardkort.
+# Installera: Inställningar > Dashboards > Lägg till dashboard > (ny, tom) > öppna den >
+#   penna > tre prickar > "Rå konfigurationseditor" > ersätt allt med innehållet i den här filen.
+title: Batteri
+views:
+  - title: Batteri
+    path: batteri
+    icon: mdi:battery-clock
+    cards:
+      # ------------------------------------------------------------------ STATUS
+      - type: markdown
+        title: Läget just nu
+        content: |
+          {% set plan = 'pyscript.smart_tou_plan' %}
+          {% set modes = {'time_of_use_luna2000': 'TOU - schemat styr', 'maximise_self_consumption': 'MSC - följer huset'} %}
+          {% set routes = {'charge': 'sparas i batteriet', 'fed_to_grid': 'säljs till nätet'} %}
+          {% set mode = states('select.battery_working_mode') %}
+          ## {{ modes.get(mode, mode) }}
+          **Nu:** {{ state_attr(plan, 'now_state') or '-' }}  
+          **Nästa:** {{ state_attr(plan, 'next_event') or 'ingen ändring planerad' }}  
+          **Batteri:** {{ states('sensor.battery_state_of_capacity') }} %  
+          **Solöverskott:** {{ routes.get(states('select.battery_excess_pv_energy_use_in_tou'), '?') }}  
+          **Utetemperatur:** {{ states('sensor.temp_average') }} °C{% if state_attr(plan, 'cold') %} (kallt: alltid TOU){% endif %}  
+          **Planen räknades:** {% set g = state_attr(plan, 'generated') %}{{ as_timestamp(g) | timestamp_custom('%d/%m %H:%M') if g else '-' }}
+          {% if state_attr(plan, 'readonly') %}
+
+          > ⚠️ **READONLY** - planen visas men skrivs inte till växelriktaren.
+          {% endif %}
+
+      # ------------------------------------------------------------------ PLAN I KLARTEXT
+      - type: markdown
+        title: Planen i klartext
+        content: |
+          {{ state_attr('pyscript.smart_tou_plan', 'explanation') or 'Ingen plan än - kör pyscript.smart_tou_replan' }}
+
+      # ------------------------------------------------------------------ SCHEMA
+      - type: markdown
+        title: Schema
+        content: |
+          {% set days = ['', 'mån', 'tis', 'ons', 'tors', 'fre', 'lör', 'sön'] %}
+          **I växelriktaren nu:**
+          {% set s = states.sensor.batteries_tou_charging_and_discharging_periods %}
+          {% for k, v in (s.attributes.items() if s else []) if k.startswith('Period') %}
+          {% set p = v.split('/') %}
+          - {% for d in p[1] %}{{ days[d | int] }}{{ ' ' }}{% endfor %}{{ p[0] }} - {{ 'laddar' if p[2] == '+' else 'laddar ur' }}
+          {% else %}
+          - (inga perioder)
+          {% endfor %}
+
+          **Senaste plan:**
+          {% for v in (state_attr('pyscript.smart_tou_plan', 'periods') or []) %}
+          {% set p = v.split('/') %}
+          - {% for d in p[1] %}{{ days[d | int] }}{{ ' ' }}{% endfor %}{{ p[0] }} - {{ 'laddar' if p[2] == '+' else 'laddar ur' }}
+          {% else %}
+          - (inga perioder - MSC)
+          {% endfor %}
+
+      # ------------------------------------------------------------------ PLAN: SCHEMA + PRIS + SoC
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Plan - schemalagd laddning/urladdning, pris och batterinivå
+          show_states: false
+        graph_span: 36h
+        span:
+          start: hour
+        now:
+          show: true
+          label: Nu
+        chart_type: line
+        apex_config:
+          chart:
+            height: 330
+          plotOptions:
+            bar:
+              columnWidth: 90%
+          legend:
+            position: bottom
+        yaxis:
+          - id: kwh
+            decimals: 1
+            apex_config:
+              title:
+                text: kWh per kvart
+          - id: price
+            opposite: true
+            decimals: 1
+            apex_config:
+              title:
+                text: kr/kWh (köp)
+          - id: soc
+            opposite: true
+            min: 0
+            max: 100
+            decimals: 0
+            apex_config:
+              title:
+                text: Batteri %
+        series:
+          - entity: pyscript.smart_tou_chart
+            name: Laddar från nät (schema)
+            type: column
+            yaxis_id: kwh
+            color: '#2e7d32'
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.sched_charge.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Laddar ur (schema)
+            type: column
+            yaxis_id: kwh
+            color: '#ef6c00'
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.sched_discharge.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Pris inkl. avgifter
+            type: line
+            curve: stepline
+            yaxis_id: price
+            color: '#c62828'
+            stroke_width: 2
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.buy.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Batteri % (prognos)
+            type: line
+            curve: smooth
+            yaxis_id: soc
+            color: '#1565c0'
+            stroke_width: 3
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.soc.map((v, i) => [a.t0 + i * a.step_ms, v]);
+
+      # ------------------------------------------------------------------ PLAN: ENERGIFLÖDEN
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Plan - energiflöden per kvart
+          show_states: false
+        graph_span: 36h
+        span:
+          start: hour
+        now:
+          show: true
+          label: Nu
+        chart_type: line
+        apex_config:
+          chart:
+            height: 300
+            stacked: true
+          plotOptions:
+            bar:
+              columnWidth: 90%
+          legend:
+            position: bottom
+          yaxis:
+            decimals: 1
+            title:
+              text: kWh per kvart (över 0 = tillförs, under 0 = går bort)
+        series:
+          - entity: pyscript.smart_tou_chart
+            name: Sol
+            type: column
+            color: '#f9a825'
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.sol.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Nät
+            type: column
+            color: '#5c6bc0'
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.grid.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Batteri (ur)
+            type: column
+            color: '#ef6c00'
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.batt_out.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Export
+            type: column
+            color: '#43a047'
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.export_neg.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Batteri (in)
+            type: column
+            color: '#8e24aa'
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.batt_in_neg.map((v, i) => [a.t0 + i * a.step_ms, v]);
+          - entity: pyscript.smart_tou_chart
+            name: Förbrukning (prognos)
+            type: line
+            curve: stepline
+            color: '#212121'
+            stroke_width: 2
+            show:
+              legend_value: false
+            data_generator: |
+              const a = entity.attributes;
+              return a.load.map((v, i) => [a.t0 + i * a.step_ms, v]);
+
+      # ------------------------------------------------------------------ UTFALL (FAKTISKT)
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Utfall - faktiska energiflöden per timme
+          show_states: false
+        graph_span: 48h
+        span:
+          end: hour
+        now:
+          show: true
+          label: Nu
+        chart_type: line
+        apex_config:
+          chart:
+            height: 330
+            stacked: true
+          plotOptions:
+            bar:
+              columnWidth: 85%
+          legend:
+            position: bottom
+        yaxis:
+          - id: kwh
+            decimals: 1
+            apex_config:
+              title:
+                text: kWh per timme (över 0 = tillförs, under 0 = går bort)
+          - id: soc
+            opposite: true
+            min: 0
+            max: 100
+            decimals: 0
+            apex_config:
+              title:
+                text: Batteri %
+        series:
+          - entity: sensor.total_solar_energy
+            name: Sol
+            type: column
+            yaxis_id: kwh
+            color: '#f9a825'
+            group_by:
+              func: diff
+              duration: 1h
+            show:
+              legend_value: false
+          - entity: sensor.power_meter_consumption
+            name: Nät (köpt)
+            type: column
+            yaxis_id: kwh
+            color: '#5c6bc0'
+            group_by:
+              func: diff
+              duration: 1h
+            show:
+              legend_value: false
+          - entity: sensor.battery_total_discharge
+            name: Batteri (ur)
+            type: column
+            yaxis_id: kwh
+            color: '#ef6c00'
+            group_by:
+              func: diff
+              duration: 1h
+            show:
+              legend_value: false
+          - entity: sensor.power_meter_exported
+            name: Export
+            type: column
+            yaxis_id: kwh
+            color: '#43a047'
+            transform: 'return -x;'
+            group_by:
+              func: diff
+              duration: 1h
+            show:
+              legend_value: false
+          - entity: sensor.battery_total_charge
+            name: Batteri (in)
+            type: column
+            yaxis_id: kwh
+            color: '#8e24aa'
+            transform: 'return -x;'
+            group_by:
+              func: diff
+              duration: 1h
+            show:
+              legend_value: false
+          - entity: sensor.battery_state_of_capacity
+            name: Batteri %
+            type: line
+            curve: smooth
+            yaxis_id: soc
+            color: '#1565c0'
+            stroke_width: 3
+            group_by:
+              func: avg
+              duration: 1h
+            show:
+              legend_value: false
+
+      # ------------------------------------------------------------------ LOGG
+      - type: markdown
+        title: Senaste händelser
+        content: |
+          {% for h in ((state_attr('pyscript.smart_tou_log', 'history') or [])[:12]) %}
+          - {{ h }}
+          {% else %}
+          - (inga händelser än)
+          {% endfor %}

@@ -1,0 +1,144 @@
+# Din befintliga graf, med fyra ändringar (markerade "ÄNDRAT"):
+#   1) sensor.battery_charge -> sensor.smart_tou_battery_charge
+#   2) sensor.battery_on     -> sensor.smart_tou_battery_on
+#   3) sensor.lowest_price -> sensor.smart_tou_price (kvartspriser, behöver inte PowerSaver)
+#   4) group_by duration: 15min på de två schema-serierna (planen har kvartsblock, standarden 1h skulle klippa block som börjar 02:45)
+# Förbrukningsserien (sensor.hourly_power_consumption) och SOC är oförändrade.
+type: custom:apexcharts-card
+header:
+  show: true
+  title: Pris 48t + Forbruk + battery_charge + battery_on + soc
+now:
+  show: true
+  label: Nå
+graph_span: 2d
+span:
+  start: day
+apex_config:
+  stroke:
+    width: 2
+  dataLabels:
+    enabled: true
+  fill:
+    type: gradient
+    gradient:
+      shadeIntensity: 1
+      inverseColors: false
+      opacityFrom: 0.45
+      opacityTo: 0.05
+      stops:
+        - 10
+        - 50
+        - 75
+        - 1000
+  legend:
+    show: false
+  yaxis:
+    - id: price
+      show: true
+      decimalsInFloat: 1
+      floating: false
+      forceNiceScale: true
+      extend_to: end
+    - id: usage
+      show: true
+      opposite: true
+      decimalsInFloat: 1
+      min: 0
+      max: auto
+      floating: false
+      forceNiceScale: true
+      extend_to: end
+    - id: powersaver1
+      show: false
+      min: 0
+      max: 1
+      decimalsInFloat: 0
+      floating: false
+      extend_to: now
+    - id: powersaver2
+      show: false
+      min: 0
+      max: 1
+      decimalsInFloat: 0
+      floating: false
+      extend_to: now
+    - id: soc
+      show: false
+      min: 0
+      max: 100
+      opposite: true
+      decimalsInFloat: 0
+      floating: false
+      extend_to: now
+series:
+  - entity: sensor.smart_tou_price               # ÄNDRAT: kvartspriser direkt från Nordpool (ersätter sensor.lowest_price)
+    yaxis_id: price
+    extend_to: now
+    name: Pris
+    type: area
+    curve: smooth
+    color: orange
+    show:
+      legend_value: false
+    data_generator: |
+      return entity.attributes.hours.map((entry) => {
+        return [new Date(entry.start), entry.price];
+      });
+  - entity: sensor.hourly_power_consumption
+    yaxis_id: usage
+    type: column
+    name: Forbruk
+    group_by:
+      func: max
+    show:
+      legend_value: false
+  - entity: sensor.smart_tou_battery_charge      # ÄNDRAT
+    data_generator: |
+      return entity.attributes.hours.map((entry) => {
+        return [new Date(entry.start), entry.onOff];
+      });
+    yaxis_id: powersaver1
+    name: " "
+    type: area
+    color: lightgreen
+    opacity: 0.2
+    stroke_width: 0
+    curve: stepline
+    group_by:
+      duration: 15min                            # ÄNDRAT
+      func: min
+    show:
+      legend_value: false
+      in_header: false
+      name_in_header: false
+      datalabels: false
+  - entity: sensor.smart_tou_battery_on          # ÄNDRAT
+    data_generator: |
+      return entity.attributes.hours.map((entry) => {
+        return [new Date(entry.start), entry.onOff];
+      });
+    yaxis_id: powersaver2
+    name: " "
+    type: area
+    color: red
+    opacity: 0.2
+    stroke_width: 0
+    curve: stepline
+    group_by:
+      duration: 15min                            # ÄNDRAT
+      func: min
+    show:
+      legend_value: false
+      in_header: false
+      name_in_header: false
+      datalabels: false
+  - entity: sensor.battery_state_of_capacity
+    extend_to: now
+    yaxis_id: soc
+    name: SOC
+    type: area
+    curve: smooth
+    color: black
+    show:
+      legend_value: false
