@@ -1,0 +1,313 @@
+# Smart TOU - dashboard
+# Kräver: HACS-kortet "apexcharts-card" (RomRider). Allt annat är standardkort.
+# Installera: Inställningar > Dashboards > Lägg till dashboard > (ny, tom) > öppna den >
+#   penna > tre prickar > "Rå konfigurationseditor" > ersätt allt med innehållet i den här filen.
+title: Batteri
+views:
+  - title: Batteri
+    path: batteri
+    icon: mdi:battery-clock
+    cards:
+      # ------------------------------------------------------------------ STATUS
+      - type: markdown
+        title: Läget just nu
+        content: |
+          {% set plan = 'pyscript.smart_tou_plan' %}
+          {% set modes = {'time_of_use_luna2000': 'TOU - schemat styr', 'maximise_self_consumption': 'MSC - följer huset'} %}
+          {% set routes = {'charge': 'sparas i batteriet', 'fed_to_grid': 'säljs till nätet'} %}
+          {% set mode = states('select.battery_working_mode') %}
+          ## {{ modes.get(mode, mode) }}
+          **Nu:** {{ state_attr(plan, 'now_state') or '-' }}  
+          **Nästa:** {{ state_attr(plan, 'next_event') or 'ingen ändring planerad' }}  
+          **Batteri:** {{ states('sensor.battery_state_of_capacity') }} %  
+          **Solöverskott:** {{ routes.get(states('select.battery_excess_pv_energy_use_in_tou'), '?') }}  
+          **Bil:** {{ state_attr(plan, 'ev') or '-' }}  
+          **Utetemperatur:** {{ states('sensor.temp_average') }} °C{% if state_attr(plan, 'cold') %} (kallt: alltid TOU){% endif %}  
+          **Planen räknades:** {% set g = state_attr(plan, 'generated') %}{{ as_timestamp(g) | timestamp_custom('%d/%m %H:%M') if g else '-' }}
+          {% if state_attr(plan, 'readonly') %}
+
+          > ⚠️ **READONLY** - planen visas men skrivs inte till växelriktaren.
+          {% endif %}
+
+      # ------------------------------------------------------------------ PLAN I KLARTEXT
+      - type: markdown
+        title: Planen i klartext
+        content: |
+          {{ state_attr('pyscript.smart_tou_plan', 'explanation') or 'Ingen plan än - kör pyscript.smart_tou_replan' }}
+
+      # ------------------------------------------------------------------ SCHEMA
+      - type: markdown
+        title: Schema
+        content: |
+          {% set days = ['', 'mån', 'tis', 'ons', 'tors', 'fre', 'lör', 'sön'] %}
+          {% macro fmt(v) %}{% set p = v.split('/') %}{% for d in p[1] %}{{ days[d | int] }}{{ ' ' }}{% endfor %}{{ p[0] }} - {{ 'laddar' if p[2] == '+' else 'laddar ur' }}{% endmacro %}
+          {% set s = states.sensor.batteries_tou_charging_and_discharging_periods %}
+          {% set ns = namespace(inv=[]) %}
+          {% for k, v in (s.attributes.items() if s else []) if k.startswith('Period') %}{% set ns.inv = ns.inv + [v] %}{% endfor %}
+          {% set plan = 'pyscript.smart_tou_plan' %}
+          {% set pl = state_attr(plan, 'periods') or [] %}
+          {% set prop = state_attr(plan, 'proposed_periods') or [] %}
+          {% if pl | sort == ns.inv | sort %}
+          **Växelriktaren följer planen:**
+          {% for v in ns.inv %}
+          - {{ fmt(v) }}
+          {% else %}
+          - (inga perioder)
+          {% endfor %}
+          {% else %}
+          **I växelriktaren nu:**
+          {% for v in ns.inv %}
+          - {{ fmt(v) }}
+          {% else %}
+          - (inga perioder)
+          {% endfor %}
+
+          **{% if state_attr(plan, 'readonly') %}Plan (READONLY - skrivs inte){% elif state_attr(plan, 'decision') == 'msc' %}TOU-alternativ (används inte, MSC valt){% else %}Planens schema{% endif %}:**
+          {% for v in pl %}
+          - {{ fmt(v) }}
+          {% else %}
+          - (inga perioder)
+          {% endfor %}
+          {% endif %}
+          {% if prop %}
+
+          **Nytt förslag som inte skrivs (för liten vinst):**
+          {% for v in prop %}
+          - {{ fmt(v) }}
+          {% endfor %}
+          {% endif %}
+
+      # ------------------------------------------------------------------ GRAF (din ApexCharts, nya sensorer)
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Pris 48t + Forbruk + battery_charge + battery_on + soc
+        now:
+          show: true
+          label: Nå
+        graph_span: 2d
+        span:
+          start: day
+        apex_config:
+          stroke:
+            width: 2
+          dataLabels:
+            enabled: true
+          fill:
+            type: gradient
+            gradient:
+              shadeIntensity: 1
+              inverseColors: false
+              opacityFrom: 0.45
+              opacityTo: 0.05
+              stops:
+                - 10
+                - 50
+                - 75
+                - 1000
+          legend:
+            show: false
+          yaxis:
+            - id: price
+              show: true
+              decimalsInFloat: 1
+              floating: false
+              forceNiceScale: true
+              extend_to: end
+            - id: usage
+              show: true
+              opposite: true
+              decimalsInFloat: 1
+              min: 0
+              max: auto
+              floating: false
+              forceNiceScale: true
+              extend_to: end
+            - id: powersaver1
+              show: false
+              min: 0
+              max: 1
+              decimalsInFloat: 0
+              floating: false
+              extend_to: now
+            - id: powersaver2
+              show: false
+              min: 0
+              max: 1
+              decimalsInFloat: 0
+              floating: false
+              extend_to: now
+            - id: soc
+              show: false
+              min: 0
+              max: 100
+              opposite: true
+              decimalsInFloat: 0
+              floating: false
+              extend_to: now
+        series:
+          - entity: sensor.smart_tou_price
+            yaxis_id: price
+            extend_to: now
+            name: Pris
+            type: area
+            curve: smooth
+            color: orange
+            show:
+              legend_value: false
+            data_generator: |
+              return entity.attributes.hours.map((entry) => {
+                return [new Date(entry.start), entry.price];
+              });
+          - entity: sensor.hourly_power_consumption
+            yaxis_id: usage
+            type: column
+            name: Forbruk
+            group_by:
+              func: max
+            show:
+              legend_value: false
+          - entity: sensor.smart_tou_battery_charge
+            data_generator: |
+              return entity.attributes.hours.map((entry) => {
+                return [new Date(entry.start), entry.onOff];
+              });
+            yaxis_id: powersaver1
+            name: " "
+            type: area
+            color: lightgreen
+            opacity: 0.2
+            stroke_width: 0
+            curve: stepline
+            group_by:
+              duration: 15min
+              func: min
+            show:
+              legend_value: false
+              in_header: false
+              name_in_header: false
+              datalabels: false
+          - entity: sensor.smart_tou_battery_on
+            data_generator: |
+              return entity.attributes.hours.map((entry) => {
+                return [new Date(entry.start), entry.onOff];
+              });
+            yaxis_id: powersaver2
+            name: " "
+            type: area
+            color: red
+            opacity: 0.2
+            stroke_width: 0
+            curve: stepline
+            group_by:
+              duration: 15min
+              func: min
+            show:
+              legend_value: false
+              in_header: false
+              name_in_header: false
+              datalabels: false
+          - entity: sensor.battery_state_of_capacity
+            extend_to: now
+            yaxis_id: soc
+            name: SOC
+            type: area
+            curve: smooth
+            color: black
+            show:
+              legend_value: false
+
+      # ------------------------------------------------------------------ ENERGIFLÖDE
+      - type: custom:power-flow-card-plus
+        entities:
+          battery:
+            entity: sensor.battery_charge_discharge_power
+            state_of_charge: sensor.battery_state_of_capacity
+            invert_state: true
+          grid:
+            entity: sensor.power_meter_active_power
+            invert_state: true
+            secondary_info:
+              entity: sensor.nordpool_kwh_se3_sek_3_10_025
+              unit_of_measurement: kr
+              decimals: 2
+              accept_negative: true
+          solar:
+            entity: sensor.inverter_input_power
+            display_zero_state: true
+          home:
+            entity: sensor.house_consumption_power
+            secondary_info:
+              entity: sensor.temp
+              unit_of_measurement: °C
+              icon: ''
+            subtract_individual: true
+          individual:
+            - entity: sensor.shellyplug_s_80646f82694c_power
+              name: Pool VP
+              icon: mdi:pool-thermometer
+              secondary_info:
+                template: '{{ state_attr(''climate.pool_vp'', ''current_temperature'') }} °C'
+                icon: ''
+                color_value: false
+                display_zero: false
+              display_zero: false
+              use_metadata: false
+              show_direction: false
+              display_zero_tolerance: 10
+            - entity: sensor.shellyplug_s_80646f8280ef_power
+              name: Pool Pump
+              display_zero: false
+              icon: mdi:water-pump
+            - entity: sensor.zag019136_charge_power
+              display_zero: false
+              name: Laddbox
+              icon: mdi:ev-station
+              display_zero_state: true
+              secondary_info:
+                entity: sensor.tesla_battery_level
+                unit_of_measurement: '%'
+            - entity: sensor.lvp_electric_consumption_w
+              name: LVP
+              icon: mdi:heat-pump-outline
+              secondary_info:
+                template: '{{ state_attr(''climate.allrum'', ''current_temperature'') }} °C'
+              display_zero: false
+              display_zero_tolerance: 10
+            - entity: sensor.garage_element_electric_consumption_w
+              display_zero: false
+              name: Garage Element
+              icon: mdi:radiator
+              secondary_info:
+                display_zero: true
+                entity: sensor.garage_garage_temperature_air_8
+                unit_of_measurement: °C
+            - entity: sensor.garage_avfuktare_power
+              display_zero: false
+              name: Garage avfuktare
+              icon: mdi:air-humidifier
+              secondary_info:
+                entity: sensor.garage_humidity
+                unit_of_measurement: '%'
+        clickable_entities: true
+        display_zero_lines: true
+        use_new_flow_rate_model: true
+        min_flow_rate: 0.75
+        max_flow_rate: 6
+        max_expected_power: 2000
+        min_expected_power: 0.01
+        transparency_zero_lines: 0
+        sort_individual_devices: false
+        kilo_threshold: 1000
+        base_decimals: 0
+        kilo_decimals: 1
+
+      # ------------------------------------------------------------------ LOGG
+      - type: markdown
+        title: Senaste händelser
+        content: |
+          {% for h in ((state_attr('pyscript.smart_tou_log', 'history') or [])[:12]) %}
+          - {{ h }}
+          {% else %}
+          - (inga händelser än)
+          {% endfor %}

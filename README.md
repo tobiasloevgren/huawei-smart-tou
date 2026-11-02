@@ -21,7 +21,6 @@ recorder:
   exclude:
     entities:
       - pyscript.smart_tou_plan     # attributen ändras ofta, onödigt att spara
-      - pyscript.smart_tou_chart    # graf-data (~11 kB), ska inte in i databasen
       - pyscript.smart_tou_sched
       - sensor.smart_tou_battery_charge
       - sensor.smart_tou_battery_on
@@ -42,7 +41,7 @@ Varje kvart väljer planeraren ett av fyra lägen (dynamisk programmering över 
 
 * Sammanhängande kvartar blir **ett block** (kan börja 02:45). Straff per ny period håller blocken långa; max 14 perioder.
 * **TOU eller MSC** avgörs av beräknad besparing i kronor mot MSC, inte av en fast prisskillnad.
-  Slår på TOU vid >= 2 kr, går tillbaka till MSC under 1 kr (hysteres).
+  Slår på TOU vid >= 2 kr. Står du redan i TOU ligger det kvar så länge planen har perioder och TOU inte är sämre än MSC (`tou_off_threshold = 0`), så att sparad energi inte tas av MSC före dyra timmar.
 * **Schemat byts bara** om den nya planen är >= 1 kr bättre än det som redan ligger inne
   (det befintliga schemat utvärderas med samma modell). Det är det som stoppar fram-och-tillbaka.
 * **Kallt väder:** under 5 °C (`sensor.temp_average`, 1 °C hysteres) väljs alltid TOU, aldrig MSC, så länge planen har några perioder. Gränsen ändras med `cold_threshold_c`.
@@ -53,17 +52,37 @@ Varje kvart väljer planeraren ett av fyra lägen (dynamisk programmering över 
 * Solprognos: halva P10 + halva P50 (justera `pv_w10/pv_w50/pv_w90`).
 * Förbrukning: medel per veckodag och timme, senaste 6 veckorna, från statistiken för `sensor.house_consumption_power_excl_ev`.
 
-## Dashboard
-`dashboard/smart_tou_dashboard.yaml` - kräver HACS-kortet **apexcharts-card**. Skapa en ny tom dashboard, öppna Rå konfigurationseditor och klistra in filen.
-Innehåll: läge/nästa händelse, planen i klartext, schema (i växelriktaren vs senaste plan), plangraf (schema + pris + batteri %),
-planerade energiflöden per kvart, faktiskt utfall per timme (dina energisensorer) och händelselogg.
-Planens data kommer från `pyscript.smart_tou_chart` (listor per kvart + `t0`).
-Sensorerna `battery_total_charge/discharge`, `total_solar_energy`, `power_meter_consumption/exported` ska vara energi i kWh (total_increasing).
+## Bil (Tesla)
+Bilen är **bara ett tidsfönster** där husbatteriet är låst: max 2 kW in och 0 kW ut (`ev_battery_charge_kw`, `ev_battery_discharge_kw`). Bilens kWh ingår **inte** i planen eller kostnaden; de används bara för att uppskatta hur länge fönstret varar (kWh kvar / 6 kW). Planen lägger urladdningen före eller efter fönstret, och laddar husbatteriet i förväg om det lönar sig.
+Du laddar själv; skriptet styr inte bilen eller laddboxen, och det är inte skriptet som spärrar batteriet till 2/0 kW (det antas något annat hos dig göra).
 
-## Gamla grafen (battery_charge / battery_on)
-`dashboard/din_graf_med_nya_sensorer.yaml` är din ApexCharts-graf med nya sensorer: `sensor.smart_tou_battery_charge` (grön), `sensor.smart_tou_battery_on` (röd) och `sensor.smart_tou_price` (kvartspriser, ersätter `sensor.lowest_price`). De har samma attribut som förut: `hours: [{start, onOff|price}]`, en post per kvart för idag + imorgon.
-Passerade kvartar minns skriptet själv (`pyscript.smart_tou_sched`), eftersom passerade perioder skrivs bort ur växelriktaren. I READONLY visar sensorerna *planen* (attributet `source` säger det); när du kör skarpt visar de det som ligger i växelriktaren.
+Så avgörs om laddning pågår eller är planerad (`sensor.zag019136_charger_mode` + `sensor.zag019136_charge_power`):
+| Läge | Tolkas som |
+|---|---|
+| `connected_charging` och effekt >= 1000 W | laddar |
+| `connected_charging` men effekt < 1000 W | liten start-laddning vid inkoppling, räknas inte |
+| `connected_requesting` | laddar (väntar på ström, t.ex. effektvakt) - om inte schematiden ligger >5 min fram, då väntar bilen på sitt schema |
+| `connected_finished`, nivå under mål, schematid i framtiden | **väntar på schemat**: laddning planerad från `sensor.tesla_scheduled_charging_start_time` |
+| `connected_finished`, schematiden passerade för <10 min sedan | bilen håller på att börja: räknas som laddande |
+| `connected_finished`, nivå = mål (eller ingen schematid) | **klar** - ingen laddning |
+| `disconnected` / inte inkopplad / nivå >= mål | ingen laddning |
+Saknas laddstatus-sensorn används bara effekten. Nivå och mål kommer från `sensor.tesla_battery_level` och `sensor.tesla_charge_limit` (78 kWh).
+
+**Omräkning för bilen** sker bara när situationen ändrats på riktigt: bilen kopplas in/ur, laddning startar, schematiden eller laddgränsen ändras, eller laddningen **har tagit slut**. Nivån och effekten i sig utlöser ingenting.
+* Effektvaktens pausar (`connected_charging` <-> `connected_requesting`, effekt 0 W) räknas som pågående laddning och ger ingen omräkning.
+* Ett laddstopp godkänns först efter 15 minuters väntan (`EV_STOP_GRACE_MIN`). Är laddningen tillbaka då sker ingen omräkning.
+* Återstående tid uppdateras ändå var 3:e timme, då nivån räknas om.
+
+## Dashboard
+`dashboard/smart_tou_dashboard.yaml` - kräver HACS-korten **apexcharts-card** och **power-flow-card-plus**. Skapa en ny tom dashboard, öppna Rå konfigurationseditor och klistra in filen.
+Innehåll: läge/nästa händelse/bil, planen i klartext, schema (växelriktaren vs plan, visas bara dubbelt när de skiljer sig), din ApexCharts-graf (pris, förbrukning, schema grön/röd, SOC), power-flow-card-plus och händelselogg.
+
+Grafen läser tre sensorer som skriptet skapar, med attributet `hours: [{start, onOff|price}]`, en post per kvart för idag + imorgon:
+`sensor.smart_tou_battery_charge` (grön), `sensor.smart_tou_battery_on` (röd) och `sensor.smart_tou_price` (kvartspriser, ersätter `sensor.lowest_price`).
+I READONLY visar sensorerna *planen* (attributet `source` säger det); när du kör skarpt visar de det som ligger i växelriktaren.
+Passerade kvartar minns skriptet själv (`pyscript.smart_tou_sched`), eftersom passerade perioder skrivs bort ur växelriktaren.
 Sensorerna är inte registrerade entiteter och försvinner vid omstart tills nästa körning (sker vid start).
+Förbrukningsserien (`sensor.hourly_power_consumption`) är din egen sensor och måste finnas kvar om du tar bort Node-RED.
 
 ## Logg
 Varje gång något ändras (schema, arbetsläge, solöverskott) skrivs en rad till HA-loggen, **Logbok** (Smart TOU) och `pyscript.smart_tou_log` (attributet `history` = senaste 30). I READONLY står det `[READONLY] Skulle ...`, annars `SKREV ...` / `ÄNDRADE ...` / `FEL ...`.

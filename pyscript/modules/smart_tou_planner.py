@@ -54,9 +54,12 @@ DEFAULTS = dict(
     terminal_percentile=0.25, # värdering av energi kvar i batteriet vid horisontens slut
     max_periods=14,
     tou_on_threshold=2.0,     # SEK: så mycket bättre än MSC måste TOU vara för att slå på
-    tou_off_threshold=1.0,    # SEK: under detta går vi tillbaka till MSC
+    tou_off_threshold=0.0,    # SEK: redan i TOU går vi bara tillbaka till MSC om TOU inte är bättre (0) eller planen saknar perioder
     cold_threshold_c=5.0,     # under denna temperatur: alltid TOU (aldrig MSC) om planen har perioder
     cold_hysteresis_c=1.0,    # redan i TOU: håll kvar tills temperaturen är gräns + detta
+    ev_kw=6.0,                # snittladdning bil (för att räkna ut hur länge den laddar)
+    ev_battery_charge_kw=2.0, # husbatteriet får laddas max så här mycket medan bilen laddar
+    ev_battery_discharge_kw=0.0,  # ...och laddas inte ur alls
     replan_min_gain=1.0,      # SEK: så mycket bättre måste ny plan vara för att byta schema
     tz="Europe/Stockholm",
     fallback_load_kw=1.0,
@@ -160,6 +163,31 @@ def build_load_profile(rows, tz_name="Europe/Stockholm", scale=1.0, shrink_k=2.0
     return prof
 
 
+def _ev_profile(dts, ev, now, tz, c):
+    """Medeleffekt (kW) för bilen per kvart. ev = {active, start, remaining_kwh}."""
+    out = [0.0] * len(dts)
+    rem = float((ev or {}).get("remaining_kwh") or 0.0)
+    if rem < 0.2:
+        return out
+    if ev.get("active"):
+        start = now.replace(minute=now.minute - now.minute % 15, second=0, microsecond=0)
+    elif ev.get("start"):
+        start = _to_dt(ev["start"], tz)
+    else:
+        return out
+    for i, dt in enumerate(dts):
+        end = dt + timedelta(minutes=15)
+        if end <= start:
+            continue
+        frac = 1.0 if dt >= start else (end - start).total_seconds() / 900.0
+        e = min(c.ev_kw * H * frac, rem)
+        out[i] = e / H
+        rem -= e
+        if rem <= 1e-9:
+            break
+    return out
+
+
 def _load_kw(profile, dt, c):
     if profile:
         v = profile.get("%d-%d" % (dt.isoweekday(), dt.hour))
@@ -173,12 +201,12 @@ def _load_kw(profile, dt, c):
 # --------------------------------------------------------------------------
 # Fysik per kvart
 # --------------------------------------------------------------------------
-def _flow(mode, E, D, S, c):
+def _flow(mode, E, D, S, c, cmax=None, dmax=None):
     """Returnerar (nätinköp kWh, export kWh, dE lagrad kWh, levererat från batteri kWh)."""
     room = (c.e_max - E) / c.eta
     if room < 0.0:
         room = 0.0
-    max_in = c.max_charge_kw * H
+    max_in = (c.max_charge_kw if cmax is None else cmax) * H
     if mode == IDLE_SELL:
         return D, S, 0.0, 0.0
     if mode == IDLE_SAVE:
@@ -192,7 +220,7 @@ def _flow(mode, E, D, S, c):
     avail = (E - c.e_min) * c.eta
     if avail < 0.0:
         avail = 0.0
-    z = min(D, c.max_discharge_kw * H, avail)
+    z = min(D, (c.max_discharge_kw if dmax is None else dmax) * H, avail)
     return D - z, S, -z / c.eta, z
 
 
@@ -261,7 +289,7 @@ def _solve(q, c, E0, init_mode, forced, tv, period_penalty):
             Vm = Vn[m]
             for i in range(S_n):
                 E = grid[i]
-                gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c)
+                gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c, qt["cmax"], qt["dmax"])
                 cost = _cost(m, qt, gi, ex, z, c)
                 Gm[i] = cost + _interp(Vm, E + dE, base, step)
             G[m] = Gm
@@ -291,7 +319,7 @@ def _solve(q, c, E0, init_mode, forced, tv, period_penalty):
             allowed.insert(0, prev)
         best = None
         for m in allowed:
-            gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c)
+            gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c, qt["cmax"], qt["dmax"])
             cost = _cost(m, qt, gi, ex, z, c)
             tot = cost + _penalty(prev, m, c, period_penalty) + _interp(V[t + 1][m], E + dE, base, step)
             if best is None or tot < best[0] - 1e-9:
@@ -332,7 +360,7 @@ def _replay(q, c, E0, modes, tv, init_mode, period_penalty):
     total = 0.0
     recs = []
     for qt, m in zip(q, modes):
-        gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c)
+        gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c, qt["cmax"], qt["dmax"])
         cost = _cost(m, qt, gi, ex, z, c)
         E = min(max(E + dE, 0.0), c.e_max)
         total += cost + _penalty(prev, m, c, period_penalty)
@@ -347,7 +375,7 @@ def _simulate_msc(q, c, E0, tv):
     total = 0.0
     for qt in q:
         m = DISCHARGE if qt["D"] > 0 else IDLE_SAVE
-        gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c)
+        gi, ex, dE, z = _flow(m, E, qt["D"], qt["S"], c, qt["cmax"], qt["dmax"])
         total += qt["p"] * gi - qt["q"] * ex + c.wear_cost * z
         E = min(max(E + dE, 0.0), c.e_max)
     return total + _terminal(E, c, tv)
@@ -473,6 +501,19 @@ def _day(d, today):
     return "idag" if diff == 0 else "imorgon" if diff == 1 else _WD[d.weekday()]
 
 
+_WD_SHORT = ["", "mån", "tis", "ons", "tors", "fre", "lör", "sön"]
+
+
+def _pretty_period(s):
+    """'16:00-22:45/2/-' -> 'tis 16:00-22:45 laddar ur'"""
+    try:
+        rng, days, sign = str(s).strip().split("/")
+        d = " ".join(_WD_SHORT[int(x)] for x in days if x.isdigit())
+        return "%s %s %s" % (d, rng, "laddar" if sign.strip() == "+" else "laddar ur")
+    except Exception:
+        return str(s)
+
+
 def _kr(x):
     return ("%.2f" % x).replace(".", ",")
 
@@ -485,14 +526,19 @@ def _cls(m):
     return 1 if m == CHARGE else 2 if m == DISCHARGE else 0
 
 
-def _explain(q, sol, c, now, decision, reason, advantage, cold, temp):
+def _explain(q, sol, c, now, decision, reason, advantage, cold, temp, kept=False, proposed=None, ev_info=None):
     today = now.date()
     modes, recs = sol["modes"], sol["recs"]
     lines = []
     head = "**%s** - %s." % ("Batteriet schemaläggs (TOU)" if decision == "tou" else "Batteriet kör MSC", reason)
-    if cold and temp is not None:
+    if cold and temp is not None and "kallt" not in reason:
         head += " Det är kallt (%s °C) så TOU används oavsett vinst." % _kwh(float(temp))
     lines.append(head)
+    if kept:
+        lines.append("Texten nedan beskriver schemat som **redan ligger i växelriktaren** (det behålls).")
+        if proposed:
+            lines.append("Det finns ett något annorlunda förslag, men vinsten är för liten för att byta schema: "
+                         + ", ".join(_pretty_period(x) for x in proposed))
 
     runs = []
     for qt, m, r in zip(q, modes, recs):
@@ -537,6 +583,24 @@ def _explain(q, sol, c, now, decision, reason, advantage, cold, temp):
     if pv:
         lines.append("Planerad sol: " + ", ".join("%s %s kWh" % (_day(d, today), _kwh(v)) for d, v in sorted(pv.items()))
                      + " (försiktig blandning av Solcast P10/P50).")
+    ev_text = None
+    evq = [qt for qt in q if qt["ev"] > 0]
+    ev_info = ev_info or {}
+    if evq:
+        a, b = evq[0]["dt"], evq[-1]["dt"] + timedelta(minutes=15)
+        lvl, lim = ev_info.get("level"), ev_info.get("limit")
+        lv = " (%d %% -> %d %%)" % (round(lvl), round(lim)) if lvl is not None and lim is not None else ""
+        if ev_info.get("active"):
+            when = "nu (väntar på ström)" if ev_info.get("waiting") else "nu"
+        else:
+            when = _day(a.date(), today) + " " + a.strftime("%H:%M")
+        ev_text = "Bil%s: laddar %s till ca %s" % (lv, when, b.strftime("%H:%M"))
+        lines.append("Bilen laddar %s-%s (uppskattat). Under tiden laddas husbatteriet max %s kW och laddas inte ur, "
+                     "så planen lägger urladdningen före eller efter." % (
+                         a.strftime("%H:%M"), b.strftime("%H:%M"), _kwh(c.ev_battery_charge_kw)))
+    elif ev_info.get("plugged") and (ev_info.get("remaining_kwh") or 0) >= 0.2:
+        ev_text = "Bil: inkopplad men ingen laddning schemalagd"
+        lines.append("Bilen är inkopplad men ingen laddning är schemalagd, så den ingår inte i planen. Starta/schemalägg laddningen så räknas planen om.")
     lines.append("Batteriet förväntas ligga på %d %% vid planens slut." % round(recs[-1]["soc_pct"]))
 
     # nuläge och nästa händelse
@@ -554,7 +618,8 @@ def _explain(q, sol, c, now, decision, reason, advantage, cold, temp):
         label = {CHARGE: "laddar från nät", DISCHARGE: "laddar ur", IDLE_SAVE: "vilar", IDLE_SELL: "vilar"}[nxt[1]]
         next_text = "%s %s %s" % (label, _day(nxt[0].date(), today), nxt[0].strftime("%H:%M"))
         next_at = nxt[0].isoformat()
-    return "\n".join("- " + ln if i else ln for i, ln in enumerate(lines)).replace("\n- ", "\n\n- ", 1), now_state, next_text, next_at
+    text = "\n".join("- " + ln if i else ln for i, ln in enumerate(lines)).replace("\n- ", "\n\n- ", 1)
+    return text, now_state, next_text, next_at, ev_text
 
 
 # --------------------------------------------------------------------------
@@ -584,15 +649,19 @@ def make_plan(inp):
 
     pvm = _pv_map(inp.get("pv"), c, tz)
     prof = inp.get("load_profile") or {}
+    ev_info = inp.get("ev") or {}
+    ev_kw = _ev_profile([d for d, _ in qraw], ev_info, now, tz, c)
     q = []
-    for dt, p in qraw:
+    for (dt, p), evk in zip(qraw, ev_kw):
         ts = int(dt.timestamp())
         pv = pvm.get(ts - ts % 1800, 0.0)
         load = _load_kw(prof, dt, c)
-        net = (load - pv) * H
+        net = (load - pv) * H   # bilens el ingår inte i planen, bara att husbatteriet är låst medan den laddar
         q.append(dict(
             dt=dt, spot=p, p=p + c.grid_cost,
-            q=p * c.export_factor + c.export_bonus - c.export_fee, load=load, pv=pv,
+            q=p * c.export_factor + c.export_bonus - c.export_fee, load=load, pv=pv, ev=evk,
+            cmax=min(c.max_charge_kw, c.ev_battery_charge_kw) if evk > 0 else c.max_charge_kw,
+            dmax=min(c.max_discharge_kw, c.ev_battery_discharge_kw) if evk > 0 else c.max_discharge_kw,
             D=net if net > 0 else 0.0, S=-net if net < 0 else 0.0,
         ))
 
@@ -659,6 +728,14 @@ def make_plan(inp):
         apply = on_tou
         reason = "TOU-fördelen är bara %.2f kr - kör MSC" % advantage
 
+    # när nuvarande schema behålls ska allt som visas beskriva DET schemat, inte förslaget
+    kept = decision == "tou" and not apply and sol_cur is not None
+    shown, shown_periods, proposed = sol, periods, None
+    if kept:
+        shown = _replay(q, c, E0, sol_cur["modes"], tv, init_mode, c.period_penalty)
+        shown_periods = list(current_periods or [])
+        proposed = periods
+
     # solrouting (select) ska följa det schema som faktiskt gäller
     if decision == "msc":
         route_modes = []
@@ -668,24 +745,26 @@ def make_plan(inp):
         route_modes = sol_cur["modes"]
 
     quarters = []
-    for qt, r in zip(q, sol["recs"]):
+    for qt, r in zip(q, shown["recs"]):
         quarters.append(dict(
             start=qt["dt"].isoformat(), price=qt["spot"], buy_price=round(qt["p"], 3), load_kw=round(qt["load"], 3), pv_kw=round(qt["pv"], 3),
             mode=MODE_NAME[r["mode"]], grid_in=round(r["grid_in"], 3), export=round(r["export"], 3),
-            soc_pct=round(r["soc_pct"], 1), pv_kwh=round(qt["pv"] * H, 3), load_kwh=round(qt["load"] * H, 3),
+            soc_pct=round(r["soc_pct"], 1), pv_kwh=round(qt["pv"] * H, 3), load_kwh=round(qt["load"] * H, 3), ev_window=1 if qt["ev"] > 0 else 0,
             batt_in=round(r["batt_in"], 3), batt_out=round(r["batt_out"], 3),
         ))
-    text, now_state, next_text, next_at = _explain(q, sol, c, now, decision, reason, advantage, cold, temp)
+    text, now_state, next_text, next_at, ev_text = _explain(
+        q, shown, c, now, decision, reason, advantage, cold, temp, kept,
+        [x for x in (proposed or []) if x not in (current_periods or [])], ev_info)
 
     return dict(
-        ok=True, cold=cold, explanation=text, now_state=now_state, next_event=next_text, next_event_at=next_at,
+        ok=True, cold=cold, explanation=text, ev_summary=ev_text, now_state=now_state, next_event=next_text, next_event_at=next_at,
         decision=decision, apply=apply, reason=reason,
-        periods=periods, route_runs=_route_runs(q[:len(route_modes)], route_modes),
+        periods=shown_periods, proposed_periods=proposed, route_runs=_route_runs(q[:len(route_modes)], route_modes),
         cost_plan=round(sol["net_cost"], 2), cost_msc=round(cost_msc, 2),
         cost_current=None if cost_cur is None else round(cost_cur, 2),
         advantage_vs_msc=round(advantage, 2),
         horizon_start=q[0]["dt"].isoformat(), horizon_end=(q[-1]["dt"] + timedelta(minutes=15)).isoformat(),
         n_quarters=len(q), terminal_value=round(tv, 3), period_penalty_used=round(pp, 3),
-        soc_end_pct=round(sol["recs"][-1]["soc_pct"], 1),
+        soc_end_pct=round(shown["recs"][-1]["soc_pct"], 1),
         quarters=quarters,
     )
